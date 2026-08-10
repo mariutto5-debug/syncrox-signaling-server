@@ -188,6 +188,4 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`HTTP/WebSocket server listening on port ${PORT}`);
-});
+server.listen(PORT, '0.0.0.0', () => { console.log(`Server running on port ${PORT}`); });
