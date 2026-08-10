@@ -1,8 +1,10 @@
 const { WebSocketServer } = require('ws');
 const crypto = require('crypto');
+const http = require('http');
 
 const PORT = process.env.PORT || 8080;
-const wss = new WebSocketServer({ port: PORT, host: '0.0.0.0' });
+const server = http.createServer();
+const wss = new WebSocketServer({ server });
 
 // Pre-shared key for HMAC authentication
 const SHARED_SECRET = 'syncrox_super_secret_key_2026';
@@ -186,4 +188,6 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-console.log(`Signaling server listening on ws://0.0.0.0:${PORT}`);
+server.listen(PORT, '0.0.0.0', () => {
+    console.log(`HTTP/WebSocket server listening on port ${PORT}`);
+});
