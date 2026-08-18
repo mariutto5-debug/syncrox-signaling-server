@@ -1,6 +1,9 @@
 const { WebSocketServer } = require('ws');
 const crypto = require('crypto');
 const http = require('http');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+
+const genAI = process.env.GEMINI_API_KEY ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY) : null;
 
 const PORT = process.env.PORT || 8080;
 const server = http.createServer((req, res) => {
@@ -9,8 +12,8 @@ const server = http.createServer((req, res) => {
 });
 const wss = new WebSocketServer({ server });
 
-// Pre-shared key for HMAC authentication
-const SHARED_SECRET = 'syncrox_super_secret_key_2026';
+// Pre-shared key for HMAC authentication — set via environment variable on the server
+const SHARED_SECRET = process.env.SHARED_SECRET || 'syncrox_super_secret_key_2026';
 
 // State
 const connectedUsers = new Map(); // userId -> ws
@@ -34,7 +37,7 @@ wss.on('connection', (ws, req) => {
         console.error(`[WS ERROR] Error on connection from ${clientIp}: ${err.message}`);
     });
 
-    ws.on('message', (message, isBinary) => {
+    ws.on('message', async (message, isBinary) => {
         if (isBinary) {
             // Handle binary audio chunk
             if (!currentUserId) return; // Unregistered user
@@ -158,6 +161,96 @@ wss.on('connection', (ws, req) => {
                         userToSession.delete(endSession.calleeId);
                     }
                     break;
+
+                case 'transcription':
+                    const { text, targetLanguage } = payload;
+                    console.log(`[TRANSCRIPTION] From ${currentUserId}: "${text}" translating to ${targetLanguage}`);
+                    
+                    if (!currentUserId) {
+                        console.warn('[TRANSCRIPTION] Unregistered user tried to translate.');
+                        break;
+                    }
+                    
+                    const transSessionToken = userToSession.get(currentUserId);
+                    if (!transSessionToken) {
+                        console.warn(`[TRANSCRIPTION] User ${currentUserId} is not in an active call.`);
+                        break;
+                    }
+                    
+                    const transSession = activeSessions.get(transSessionToken);
+                    if (!transSession) {
+                        console.warn(`[TRANSCRIPTION] Active session not found for token ${transSessionToken}.`);
+                        break;
+                    }
+                    
+                    // Determine Utente B
+                    const recipientId = transSession.callerId === currentUserId ? transSession.calleeId : transSession.callerId;
+                    const recipientWs = connectedUsers.get(recipientId);
+                    
+                    if (!recipientWs || recipientWs.readyState !== 1) {
+                        console.warn(`[TRANSCRIPTION] Recipient ${recipientId} is not connected or open.`);
+                        break;
+                    }
+
+                    if (!genAI) {
+                        console.error('[TRANSCRIPTION] Gemini API is not configured (GEMINI_API_KEY env var missing).');
+                        // Fallback: send original text
+                        recipientWs.send(JSON.stringify({
+                            type: 'transcription',
+                            payload: {
+                                text: text,
+                                originalText: text,
+                                targetLanguage: targetLanguage,
+                                error: 'Gemini API not configured'
+                            }
+                        }));
+                        break;
+                    }
+
+                    try {
+                        const systemPrompt = `Sei un interprete telefonico simultaneo professionale in tempo reale.
+Traduci il testo fornito dall'utente nella seguente lingua target: ${targetLanguage}.
+
+Regole di traduzione:
+1. Rileva ed emula automaticamente il livello di formalità del parlante (usa il 'Lei'/formale o 'Tu'/informale a seconda del contesto).
+2. Rimuovi automaticamente balbettii, esitazioni, parole riempitive e ripetizioni (es. 'ehm', 'ah', 'cioè').
+3. Mantieni un tono di parlato naturale, scorrevole ed emotivamente coerente con la frase originale.
+
+REGOLE FONDAMENTALI: Restituisci ESCLUSIVAMENTE la frase tradotta. Non aggiungere mai commenti, introduzioni, spiegazioni, virgolette o prefissi come 'Ecco la traduzione:'.`;
+
+                        const model = genAI.getGenerativeModel({
+                            model: "gemini-2.0-flash",
+                            systemInstruction: systemPrompt
+                        });
+
+                        const result = await model.generateContent(text);
+                        const response = await result.response;
+                        const translatedText = response.text().trim();
+                        
+                        console.log(`[TRANSCRIPTION] Translation success: "${translatedText}"`);
+                        
+                        recipientWs.send(JSON.stringify({
+                            type: 'transcription',
+                            payload: {
+                                text: translatedText,
+                                originalText: text,
+                                targetLanguage: targetLanguage
+                            }
+                        }));
+                    } catch (err) {
+                        console.error(`[TRANSCRIPTION] Error calling Gemini: ${err.message}`);
+                        // Fallback: send original text
+                        recipientWs.send(JSON.stringify({
+                            type: 'transcription',
+                            payload: {
+                                text: text,
+                                originalText: text,
+                                targetLanguage: targetLanguage,
+                                error: err.message
+                            }
+                        }));
+                    }
+                    break;
             }
         } catch (e) {
             console.error(`[ERROR] Failed to parse message: ${e.message}`);
@@ -192,3 +285,4 @@ wss.on('connection', (ws, req) => {
 });
 
 server.listen(PORT, '0.0.0.0', () => { console.log(`Server running on port ${PORT}`); });
+
