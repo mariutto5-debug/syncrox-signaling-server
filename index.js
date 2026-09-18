@@ -26,25 +26,18 @@ const CARTESIA_FEMALE_VOICE_ID = process.env.CARTESIA_FEMALE_VOICE_ID || 'a0e998
 
 // State Management
 const connectedUsers = new Map();  // userId -> ws
-const connectedPhones = new Map(); // normalized phoneNumber -> ws
+const connectedPhones = new Map(); // sanitized phoneNumber -> ws
 const userToPhone = new Map();     // userId -> phoneNumber
 const phoneToUser = new Map();     // phoneNumber -> userId
 const userGenders = new Map();     // userId -> 'male' | 'female'
 const activeSessions = new Map();  // sessionToken -> { callerId, calleeId }
 const userToSession = new Map();   // userId -> sessionToken
 
-function normalizePhone(phone) {
-  if (!phone) return '';
-  const str = String(phone).trim();
-  const hasPlus = str.startsWith('+');
-  const digits = str.replace(/\D/g, '');
-  if (!digits) return '';
-  if (hasPlus) return '+' + digits;
-  // Default Italian prefix +39 if 9-10 digits starting with 3
-  if (digits.startsWith('3') && (digits.length === 9 || digits.length === 10)) {
-    return '+39' + digits;
-  }
-  return '+' + digits;
+function cleanNumber(raw) {
+  if (!raw) return '';
+  const cleaned = String(raw).replace(/[^\d+]/g, '');
+  if (cleaned.length < 3) return cleaned;
+  return cleaned;
 }
 
 function verifyHmac(payloadStr, receivedHmac) {
@@ -56,24 +49,26 @@ function verifyHmac(payloadStr, receivedHmac) {
 }
 
 function findUserWs(targetId, targetPhone) {
+  const cleanPhone = cleanNumber(targetPhone);
+  const cleanId = cleanNumber(targetId);
+
   if (targetId && connectedUsers.has(targetId)) {
     return connectedUsers.get(targetId);
   }
-  
-  const normIdPhone = normalizePhone(targetId);
-  if (normIdPhone && connectedPhones.has(normIdPhone)) {
-    return connectedPhones.get(normIdPhone);
+  if (cleanId && connectedUsers.has(cleanId)) {
+    return connectedUsers.get(cleanId);
+  }
+  if (cleanId && connectedPhones.has(cleanId)) {
+    return connectedPhones.get(cleanId);
+  }
+  if (cleanPhone && connectedPhones.has(cleanPhone)) {
+    return connectedPhones.get(cleanPhone);
   }
 
-  const normTargetPhone = normalizePhone(targetPhone);
-  if (normTargetPhone && connectedPhones.has(normTargetPhone)) {
-    return connectedPhones.get(normTargetPhone);
-  }
-
-  // Suffix matching (last 9 digits) for international vs local differences
-  const targetDigits = (normTargetPhone || normIdPhone || String(targetId)).replace(/\D/g, '');
-  if (targetDigits.length >= 7) {
-    const suffix = targetDigits.slice(-9);
+  // Suffix matching (last 7 digits) if length >= 7
+  const digits = (cleanPhone || cleanId || String(targetId || '')).replace(/\D/g, '');
+  if (digits.length >= 7) {
+    const suffix = digits.slice(-7);
     for (const [phone, ws] of connectedPhones.entries()) {
       const pDigits = phone.replace(/\D/g, '');
       if (pDigits.endsWith(suffix)) {
@@ -168,12 +163,12 @@ wss.on('connection', (ws, req) => {
             if (gender) userGenders.set(userId, gender);
 
             if (phoneNumber) {
-              const normPhone = normalizePhone(phoneNumber);
-              currentPhoneNumber = normPhone;
-              connectedPhones.set(normPhone, ws);
-              userToPhone.set(userId, normPhone);
-              phoneToUser.set(normPhone, userId);
-              console.log(`[REGISTER] Utente ${userId} registrato con numero ${normPhone} (Genere: ${gender || 'male'}).`);
+              const sanitizedP = cleanNumber(phoneNumber);
+              currentPhoneNumber = sanitizedP;
+              connectedPhones.set(sanitizedP, ws);
+              userToPhone.set(userId, sanitizedP);
+              phoneToUser.set(sanitizedP, userId);
+              console.log(`[REGISTER] Utente ${userId} registrato con numero sanificato ${sanitizedP} (Genere: ${gender || 'male'}).`);
             } else {
               console.log(`[REGISTER] Utente ${userId} registrato senza numero (Genere: ${gender || 'male'}).`);
             }
@@ -199,15 +194,15 @@ wss.on('connection', (ws, req) => {
           
           if (Array.isArray(numbers)) {
             for (const inputNum of numbers) {
-              const normInput = normalizePhone(inputNum);
-              if (connectedPhones.has(normInput)) {
+              const cleanInput = cleanNumber(inputNum);
+              if (connectedPhones.has(cleanInput)) {
                 onlineNumbersSet.add(inputNum);
-                onlineNumbersSet.add(normInput);
+                onlineNumbersSet.add(cleanInput);
               } else {
-                // Suffix matching
-                const digits = normInput.replace(/\D/g, '');
+                // Suffix matching (last 7 digits)
+                const digits = cleanInput.replace(/\D/g, '');
                 if (digits.length >= 7) {
-                  const suffix = digits.slice(-9);
+                  const suffix = digits.slice(-7);
                   for (const phone of connectedPhones.keys()) {
                     if (phone.replace(/\D/g, '').endsWith(suffix)) {
                       onlineNumbersSet.add(inputNum);
@@ -230,17 +225,32 @@ wss.on('connection', (ws, req) => {
           break;
         }
 
+        case 'call_user':
         case 'call_request': {
-          const { callerId, calleeId, targetPhoneNumber, callerPhoneNumber, sessionToken, callerName, gender } = payload || {};
-          if (gender && callerId) userGenders.set(callerId, gender);
-          
-          console.log(`[CALL REQUEST] Caller: ${callerId} (${callerPhoneNumber}) -> Callee Target: ${calleeId} / ${targetPhoneNumber} (Session: ${sessionToken})`);
+          const {
+            callerId,
+            callerPhoneNumber,
+            callerName,
+            calleeId,
+            targetUserId,
+            targetPhoneNumber,
+            calleePhoneNumber,
+            sessionToken,
+            gender
+          } = payload || {};
 
-          const calleeWs = findUserWs(calleeId, targetPhoneNumber);
-          
+          if (gender && callerId) userGenders.set(callerId, gender);
+
+          const cleanCallerPhone = cleanNumber(callerPhoneNumber);
+          const cleanTargetPhone = cleanNumber(targetPhoneNumber || calleePhoneNumber || targetUserId || calleeId);
+          const targetId = targetUserId || calleeId;
+
+          console.log(`[CALL REQUEST] Caller: ${callerId} (${cleanCallerPhone}) -> Target ID: ${targetId} / Target Phone: ${cleanTargetPhone} (Session: ${sessionToken})`);
+
+          const calleeWs = findUserWs(targetId, cleanTargetPhone);
+
           if (calleeWs && calleeWs.readyState === 1) {
-            // Find actual userId for callee socket
-            let actualCalleeId = calleeId;
+            let actualCalleeId = targetId;
             for (const [uid, uws] of connectedUsers.entries()) {
               if (uws === calleeWs) {
                 actualCalleeId = uid;
@@ -254,10 +264,15 @@ wss.on('connection', (ws, req) => {
 
             calleeWs.send(JSON.stringify({
               type: 'incoming_call',
-              payload: { callerId, callerPhoneNumber, callerName, sessionToken }
+              payload: {
+                callerId,
+                callerPhoneNumber: cleanCallerPhone,
+                callerName: callerName || 'Utente Syncrox',
+                sessionToken
+              }
             }));
           } else {
-            console.warn(`[CALL REJECTED] Callee ${calleeId} (${targetPhoneNumber}) non trovato o offline.`);
+            console.warn(`[CALL REJECTED] Target ${targetId} (${cleanTargetPhone}) non trovato o offline.`);
             ws.send(JSON.stringify({
               type: 'call_rejected',
               payload: { sessionToken, reason: 'user_offline' }
