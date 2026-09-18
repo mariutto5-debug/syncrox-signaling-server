@@ -25,22 +25,69 @@ const CARTESIA_MALE_VOICE_ID = process.env.CARTESIA_MALE_VOICE_ID || 'b7d50908-b
 const CARTESIA_FEMALE_VOICE_ID = process.env.CARTESIA_FEMALE_VOICE_ID || 'a0e99841-438c-4a64-b679-ae501e7d6091';
 
 // State Management
-const connectedUsers = new Map(); // userId -> ws
-const userGenders = new Map();    // userId -> 'male' | 'female'
-const activeSessions = new Map(); // sessionToken -> { callerId, calleeId }
-const userToSession = new Map();  // userId -> sessionToken
+const connectedUsers = new Map();  // userId -> ws
+const connectedPhones = new Map(); // normalized phoneNumber -> ws
+const userToPhone = new Map();     // userId -> phoneNumber
+const phoneToUser = new Map();     // phoneNumber -> userId
+const userGenders = new Map();     // userId -> 'male' | 'female'
+const activeSessions = new Map();  // sessionToken -> { callerId, calleeId }
+const userToSession = new Map();   // userId -> sessionToken
+
+function normalizePhone(phone) {
+  if (!phone) return '';
+  const str = String(phone).trim();
+  const hasPlus = str.startsWith('+');
+  const digits = str.replace(/\D/g, '');
+  if (!digits) return '';
+  if (hasPlus) return '+' + digits;
+  // Default Italian prefix +39 if 9-10 digits starting with 3
+  if (digits.startsWith('3') && (digits.length === 9 || digits.length === 10)) {
+    return '+39' + digits;
+  }
+  return '+' + digits;
+}
 
 function verifyHmac(payloadStr, receivedHmac) {
-  if (!receivedHmac) return true; // Graceful fallback if client signature disabled during dev
+  if (!receivedHmac) return true;
   const hmac = crypto.createHmac('sha256', SHARED_SECRET);
   hmac.update(payloadStr);
   const calculated = hmac.digest('hex');
   return calculated === receivedHmac;
 }
 
+function findUserWs(targetId, targetPhone) {
+  if (targetId && connectedUsers.has(targetId)) {
+    return connectedUsers.get(targetId);
+  }
+  
+  const normIdPhone = normalizePhone(targetId);
+  if (normIdPhone && connectedPhones.has(normIdPhone)) {
+    return connectedPhones.get(normIdPhone);
+  }
+
+  const normTargetPhone = normalizePhone(targetPhone);
+  if (normTargetPhone && connectedPhones.has(normTargetPhone)) {
+    return connectedPhones.get(normTargetPhone);
+  }
+
+  // Suffix matching (last 9 digits) for international vs local differences
+  const targetDigits = (normTargetPhone || normIdPhone || String(targetId)).replace(/\D/g, '');
+  if (targetDigits.length >= 7) {
+    const suffix = targetDigits.slice(-9);
+    for (const [phone, ws] of connectedPhones.entries()) {
+      const pDigits = phone.replace(/\D/g, '');
+      if (pDigits.endsWith(suffix)) {
+        return ws;
+      }
+    }
+  }
+
+  return null;
+}
+
 async function generateCartesiaTts(text, gender = 'male') {
   if (!CARTESIA_API_KEY) {
-    console.warn('[CARTESIA] CARTESIA_API_KEY non configurata in env vars.');
+    console.warn('[CARTESIA] CARTESIA_API_KEY non configurata.');
     return null;
   }
   const voiceId = gender === 'female' ? CARTESIA_FEMALE_VOICE_ID : CARTESIA_MALE_VOICE_ID;
@@ -55,15 +102,8 @@ async function generateCartesiaTts(text, gender = 'male') {
       body: JSON.stringify({
         model_id: 'sonic-multilingual',
         transcript: text,
-        voice: {
-          mode: 'id',
-          id: voiceId,
-        },
-        output_format: {
-          container: 'raw',
-          encoding: 'pcm_s16le',
-          sample_rate: 24000,
-        },
+        voice: { mode: 'id', id: voiceId },
+        output_format: { container: 'raw', encoding: 'pcm_s16le', sample_rate: 24000 },
       }),
     });
 
@@ -83,6 +123,7 @@ async function generateCartesiaTts(text, gender = 'male') {
 
 wss.on('connection', (ws, req) => {
   let currentUserId = null;
+  let currentPhoneNumber = null;
   const clientIp = req.socket.remoteAddress;
   console.log(`[CONNECTION] Nuova connessione da IP: ${clientIp}`);
 
@@ -120,13 +161,24 @@ wss.on('connection', (ws, req) => {
 
       switch (type) {
         case 'register': {
-          const { userId, gender } = payload || {};
+          const { userId, phoneNumber, gender } = payload || {};
           if (userId) {
             currentUserId = userId;
             connectedUsers.set(userId, ws);
             if (gender) userGenders.set(userId, gender);
-            console.log(`[REGISTER] Utente ${userId} registrato (Genere: ${gender || 'male'}).`);
-            ws.send(JSON.stringify({ type: 'registered', payload: { ok: true, userId } }));
+
+            if (phoneNumber) {
+              const normPhone = normalizePhone(phoneNumber);
+              currentPhoneNumber = normPhone;
+              connectedPhones.set(normPhone, ws);
+              userToPhone.set(userId, normPhone);
+              phoneToUser.set(normPhone, userId);
+              console.log(`[REGISTER] Utente ${userId} registrato con numero ${normPhone} (Genere: ${gender || 'male'}).`);
+            } else {
+              console.log(`[REGISTER] Utente ${userId} registrato senza numero (Genere: ${gender || 'male'}).`);
+            }
+
+            ws.send(JSON.stringify({ type: 'registered', payload: { ok: true, userId, phoneNumber: currentPhoneNumber } }));
           }
           break;
         }
@@ -140,31 +192,72 @@ wss.on('connection', (ws, req) => {
           break;
         }
 
+        case 'check_online_contacts':
         case 'check_syncrox_users': {
-          const activeIds = Array.from(connectedUsers.keys());
+          const { numbers } = payload || {};
+          const onlineNumbersSet = new Set();
+          
+          if (Array.isArray(numbers)) {
+            for (const inputNum of numbers) {
+              const normInput = normalizePhone(inputNum);
+              if (connectedPhones.has(normInput)) {
+                onlineNumbersSet.add(inputNum);
+                onlineNumbersSet.add(normInput);
+              } else {
+                // Suffix matching
+                const digits = normInput.replace(/\D/g, '');
+                if (digits.length >= 7) {
+                  const suffix = digits.slice(-9);
+                  for (const phone of connectedPhones.keys()) {
+                    if (phone.replace(/\D/g, '').endsWith(suffix)) {
+                      onlineNumbersSet.add(inputNum);
+                      onlineNumbersSet.add(phone);
+                      break;
+                    }
+                  }
+                }
+              }
+            }
+          }
+
           ws.send(JSON.stringify({
-            type: 'syncrox_users',
-            payload: { activeNumbers: activeIds }
+            type: 'online_contacts_response',
+            payload: {
+              onlineNumbers: Array.from(onlineNumbersSet),
+              activeNumbers: Array.from(connectedPhones.keys())
+            }
           }));
           break;
         }
 
         case 'call_request': {
-          const { callerId, calleeId, sessionToken, callerName, gender } = payload || {};
-          if (gender) userGenders.set(callerId, gender);
-          console.log(`[CALL REQUEST] ${callerId} -> ${calleeId} (Session: ${sessionToken})`);
+          const { callerId, calleeId, targetPhoneNumber, callerPhoneNumber, sessionToken, callerName, gender } = payload || {};
+          if (gender && callerId) userGenders.set(callerId, gender);
+          
+          console.log(`[CALL REQUEST] Caller: ${callerId} (${callerPhoneNumber}) -> Callee Target: ${calleeId} / ${targetPhoneNumber} (Session: ${sessionToken})`);
 
-          const calleeWs = connectedUsers.get(calleeId);
+          const calleeWs = findUserWs(calleeId, targetPhoneNumber);
+          
           if (calleeWs && calleeWs.readyState === 1) {
-            activeSessions.set(sessionToken, { callerId, calleeId });
+            // Find actual userId for callee socket
+            let actualCalleeId = calleeId;
+            for (const [uid, uws] of connectedUsers.entries()) {
+              if (uws === calleeWs) {
+                actualCalleeId = uid;
+                break;
+              }
+            }
+
+            activeSessions.set(sessionToken, { callerId, calleeId: actualCalleeId });
             userToSession.set(callerId, sessionToken);
-            userToSession.set(calleeId, sessionToken);
+            userToSession.set(actualCalleeId, sessionToken);
 
             calleeWs.send(JSON.stringify({
               type: 'incoming_call',
-              payload: { callerId, callerName, sessionToken }
+              payload: { callerId, callerPhoneNumber, callerName, sessionToken }
             }));
           } else {
+            console.warn(`[CALL REJECTED] Callee ${calleeId} (${targetPhoneNumber}) non trovato o offline.`);
             ws.send(JSON.stringify({
               type: 'call_rejected',
               payload: { sessionToken, reason: 'user_offline' }
@@ -179,23 +272,33 @@ wss.on('connection', (ws, req) => {
           const session = activeSessions.get(st);
           if (session) {
             const callerWs = connectedUsers.get(session.callerId);
-            if (callerWs && callerWs.readyState === 1) {
-              if (accepted) {
-                console.log(`[CALL ACCEPTED] Sessione: ${st}`);
+            const calleeWs = connectedUsers.get(session.calleeId);
+
+            if (accepted) {
+              console.log(`[CALL ACCEPTED] Sessione: ${st}`);
+              if (callerWs && callerWs.readyState === 1) {
                 callerWs.send(JSON.stringify({
                   type: 'call_accepted',
                   payload: { sessionToken: st }
                 }));
-              } else {
-                console.log(`[CALL REJECTED] Sessione: ${st}`);
+              }
+              if (calleeWs && calleeWs.readyState === 1) {
+                calleeWs.send(JSON.stringify({
+                  type: 'call_accepted',
+                  payload: { sessionToken: st }
+                }));
+              }
+            } else {
+              console.log(`[CALL REJECTED] Sessione: ${st}`);
+              if (callerWs && callerWs.readyState === 1) {
                 callerWs.send(JSON.stringify({
                   type: 'call_rejected',
                   payload: { sessionToken: st, reason: 'declined' }
                 }));
-                activeSessions.delete(st);
-                userToSession.delete(session.callerId);
-                userToSession.delete(session.calleeId);
               }
+              activeSessions.delete(st);
+              userToSession.delete(session.callerId);
+              userToSession.delete(session.calleeId);
             }
           }
           break;
@@ -264,18 +367,15 @@ wss.on('connection', (ws, req) => {
 
             console.log(`[TRANSLATION] ${currentUserId} -> ${recipientId}: "${translatedText}"`);
 
-            // 1. Invio Sottotitolo
             recipientWs.send(JSON.stringify({
               type: 'subtitle',
               payload: { text: translatedText, senderId: currentUserId }
             }));
-            // Anche transcription event per compatibilità
             recipientWs.send(JSON.stringify({
               type: 'transcription',
               payload: { text: translatedText, originalText: text }
             }));
 
-            // 2. Invio Voce Sintetizzata via Cartesia TTS
             const speakerGender = userGenders.get(currentUserId) || 'male';
             const audioBuffer = await generateCartesiaTts(translatedText, speakerGender);
             if (audioBuffer) {
@@ -297,8 +397,9 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     if (currentUserId) {
-      console.log(`[DISCONNECT] Utente ${currentUserId} disconnesso.`);
+      console.log(`[DISCONNECT] Utente ${currentUserId} (${currentPhoneNumber || 'No Phone'}) disconnesso.`);
       connectedUsers.delete(currentUserId);
+      if (currentPhoneNumber) connectedPhones.delete(currentPhoneNumber);
       userGenders.delete(currentUserId);
 
       const sessionToken = userToSession.get(currentUserId);
