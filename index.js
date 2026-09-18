@@ -25,8 +25,8 @@ const CARTESIA_MALE_VOICE_ID = process.env.CARTESIA_MALE_VOICE_ID || 'b7d50908-b
 const CARTESIA_FEMALE_VOICE_ID = process.env.CARTESIA_FEMALE_VOICE_ID || 'a0e99841-438c-4a64-b679-ae501e7d6091';
 
 // State Management
-const connectedUsers = new Map();  // userId -> ws
-const connectedPhones = new Map(); // sanitized phoneNumber -> ws
+const connectedUsers = new Map();  // userId/phone -> ws
+const connectedPhones = new Map(); // clean phoneNumber -> ws
 const userToPhone = new Map();     // userId -> phoneNumber
 const phoneToUser = new Map();     // phoneNumber -> userId
 const userGenders = new Map();     // userId -> 'male' | 'female'
@@ -35,9 +35,7 @@ const userToSession = new Map();   // userId -> sessionToken
 
 function cleanNumber(raw) {
   if (!raw) return '';
-  const cleaned = String(raw).replace(/[^\d+]/g, '');
-  if (cleaned.length < 3) return cleaned;
-  return cleaned;
+  return String(raw).replace(/[^\d+]/g, '');
 }
 
 function verifyHmac(payloadStr, receivedHmac) {
@@ -49,24 +47,24 @@ function verifyHmac(payloadStr, receivedHmac) {
 }
 
 function findUserWs(targetId, targetPhone) {
-  const cleanPhone = cleanNumber(targetPhone);
-  const cleanId = cleanNumber(targetId);
+  const cleanP = cleanNumber(targetPhone || targetId);
+  const cleanI = cleanNumber(targetId);
 
   if (targetId && connectedUsers.has(targetId)) {
     return connectedUsers.get(targetId);
   }
-  if (cleanId && connectedUsers.has(cleanId)) {
-    return connectedUsers.get(cleanId);
+  if (cleanI && connectedUsers.has(cleanI)) {
+    return connectedUsers.get(cleanI);
   }
-  if (cleanId && connectedPhones.has(cleanId)) {
-    return connectedPhones.get(cleanId);
+  if (cleanP && connectedPhones.has(cleanP)) {
+    return connectedPhones.get(cleanP);
   }
-  if (cleanPhone && connectedPhones.has(cleanPhone)) {
-    return connectedPhones.get(cleanPhone);
+  if (cleanI && connectedPhones.has(cleanI)) {
+    return connectedPhones.get(cleanI);
   }
 
   // Suffix matching (last 7 digits) if length >= 7
-  const digits = (cleanPhone || cleanId || String(targetId || '')).replace(/\D/g, '');
+  const digits = (cleanP || cleanI || String(targetId || '')).replace(/\D/g, '');
   if (digits.length >= 7) {
     const suffix = digits.slice(-7);
     for (const [phone, ws] of connectedPhones.entries()) {
@@ -156,24 +154,30 @@ wss.on('connection', (ws, req) => {
 
       switch (type) {
         case 'register': {
-          const { userId, phoneNumber, gender } = payload || {};
-          if (userId) {
-            currentUserId = userId;
-            connectedUsers.set(userId, ws);
-            if (gender) userGenders.set(userId, gender);
+          const { userId, phoneNumber, phone, gender } = payload || {};
+          const rawPhone = phoneNumber || phone || userId || '';
+          const cleanP = cleanNumber(rawPhone);
 
-            if (phoneNumber) {
-              const sanitizedP = cleanNumber(phoneNumber);
-              currentPhoneNumber = sanitizedP;
-              connectedPhones.set(sanitizedP, ws);
-              userToPhone.set(userId, sanitizedP);
-              phoneToUser.set(sanitizedP, userId);
-              console.log(`[REGISTER] Utente ${userId} registrato con numero sanificato ${sanitizedP} (Genere: ${gender || 'male'}).`);
-            } else {
-              console.log(`[REGISTER] Utente ${userId} registrato senza numero (Genere: ${gender || 'male'}).`);
-            }
+          if (cleanP) {
+            currentUserId = cleanP;
+            currentPhoneNumber = cleanP;
+            connectedUsers.set(cleanP, ws);
+            connectedPhones.set(cleanP, ws);
+            userToPhone.set(cleanP, cleanP);
+            phoneToUser.set(cleanP, cleanP);
+            if (gender) userGenders.set(cleanP, gender);
 
-            ws.send(JSON.stringify({ type: 'registered', payload: { ok: true, userId, phoneNumber: currentPhoneNumber } }));
+            console.log(`[REGISTER] Utente registrato con numero REALE sanificato: ${cleanP} (Genere: ${gender || 'male'}).`);
+            ws.send(JSON.stringify({
+              type: 'registered',
+              payload: { ok: true, userId: cleanP, phoneNumber: cleanP, phone: cleanP }
+            }));
+          } else {
+            console.warn(`[REGISTER REJECTED] Tentativo di registrazione senza un numero di telefono valido (raw: "${rawPhone}").`);
+            ws.send(JSON.stringify({
+              type: 'register_failed',
+              payload: { ok: false, reason: 'invalid_phone_number' }
+            }));
           }
           break;
         }
@@ -239,18 +243,17 @@ wss.on('connection', (ws, req) => {
             gender
           } = payload || {};
 
-          if (gender && callerId) userGenders.set(callerId, gender);
+          const cleanCaller = cleanNumber(callerPhoneNumber || callerId);
+          const cleanTarget = cleanNumber(targetPhoneNumber || calleePhoneNumber || targetUserId || calleeId);
 
-          const cleanCallerPhone = cleanNumber(callerPhoneNumber);
-          const cleanTargetPhone = cleanNumber(targetPhoneNumber || calleePhoneNumber || targetUserId || calleeId);
-          const targetId = targetUserId || calleeId;
+          if (gender && cleanCaller) userGenders.set(cleanCaller, gender);
 
-          console.log(`[CALL REQUEST] Caller: ${callerId} (${cleanCallerPhone}) -> Target ID: ${targetId} / Target Phone: ${cleanTargetPhone} (Session: ${sessionToken})`);
+          console.log(`[CALL USER] Caller: ${cleanCaller} -> Target: ${cleanTarget} (Session: ${sessionToken})`);
 
-          const calleeWs = findUserWs(targetId, cleanTargetPhone);
+          const calleeWs = findUserWs(cleanTarget, cleanTarget);
 
           if (calleeWs && calleeWs.readyState === 1) {
-            let actualCalleeId = targetId;
+            let actualCalleeId = cleanTarget;
             for (const [uid, uws] of connectedUsers.entries()) {
               if (uws === calleeWs) {
                 actualCalleeId = uid;
@@ -258,21 +261,21 @@ wss.on('connection', (ws, req) => {
               }
             }
 
-            activeSessions.set(sessionToken, { callerId, calleeId: actualCalleeId });
-            userToSession.set(callerId, sessionToken);
+            activeSessions.set(sessionToken, { callerId: cleanCaller, calleeId: actualCalleeId });
+            userToSession.set(cleanCaller, sessionToken);
             userToSession.set(actualCalleeId, sessionToken);
 
             calleeWs.send(JSON.stringify({
               type: 'incoming_call',
               payload: {
-                callerId,
-                callerPhoneNumber: cleanCallerPhone,
+                callerId: cleanCaller,
+                callerPhoneNumber: cleanCaller,
                 callerName: callerName || 'Utente Syncrox',
                 sessionToken
               }
             }));
           } else {
-            console.warn(`[CALL REJECTED] Target ${targetId} (${cleanTargetPhone}) non trovato o offline.`);
+            console.warn(`[CALL REJECTED] Target ${cleanTarget} non trovato o offline.`);
             ws.send(JSON.stringify({
               type: 'call_rejected',
               payload: { sessionToken, reason: 'user_offline' }
@@ -368,7 +371,7 @@ wss.on('connection', (ws, req) => {
             const systemPrompt = `Sei un interprete telefonico simultaneo professionale in tempo reale.
 1. Traduci il testo fornito dall'utente dalla lingua di origine alla lingua target della chiamata (${targetLanguage || 'italiano'}).
 2. Rileva ed emula automaticamente il livello di formalità del parlante (formale o informale a seconda del contesto).
-3. Rimuovi automaticamente balbettii, esitazioni e parole riempitive (come 'ehm', 'cioè').
+3. Rimuovi automaticamente balbettii, esitazioni e parole riempitive (como 'ehm', 'cioè').
 4. Mantieni un tono di parlato naturale e fluido.
 5. REGOLE FONDAMENTALI: Restituisci ESCLUSIVAMENTE il testo tradotto, senza introduzioni, commenti o punteggiatura extra.`;
 
